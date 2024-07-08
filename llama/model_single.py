@@ -41,6 +41,12 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
+# Computes the values on the fly, accepting potentially non-integer indices
+def compute_freqs_cis(t : torch.Tensor, dim: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=t.device)[: (dim // 2)].float() / dim))
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
@@ -90,15 +96,15 @@ class Attention(nn.Module):
             args.dim,
             bias=False,
         )
-        self.cache_k = torch.zeros(
-            (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
-        )
-        self.cache_v = torch.zeros(
-            (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
-        )
-        if hiq.get_env_bool("KV_CAHCHE_IN_GPU", True):
-            self.cache_k = self.cache_k.cuda()
-            self.cache_v = self.cache_v.cuda()
+        # self.cache_k = torch.zeros(
+        #     (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+        # )
+        # self.cache_v = torch.zeros(
+        #     (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+        # )
+        # if hiq.get_env_bool("KV_CAHCHE_IN_GPU", True):
+        #     self.cache_k = self.cache_k.cuda()
+        #     self.cache_v = self.cache_v.cuda()
 
     def forward(
         self,
@@ -116,14 +122,21 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
+        # We've disabled the cache. This makes the model stateless, but also slower.
+        # It also slightly breaks compatibility with the standard generate function
+        # (which feeds inputs one token at the time, and expects the model to remember the previous states)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        #self.cache_k = self.cache_k.to(xq)
+        #self.cache_v = self.cache_v.to(xq)
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        #self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        #self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+        #keys = self.cache_k[:bsz, : start_pos + seqlen]
+        #values = self.cache_v[:bsz, : start_pos + seqlen]
+
+        keys = xk
+        values = xv
 
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
@@ -201,16 +214,29 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        self.freqs_cis = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
-        )
+        # self.freqs_cis = precompute_freqs_cis(
+        #     self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+        # )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, idx_override = None, interpolation_factor=None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        #self.freqs_cis = self.freqs_cis.to(h.device)
+        #freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        standard_idx = torch.arange(start_pos, start_pos + seqlen, device=h.device)
+
+        # Compute on the fly
+        if idx_override is not None:
+            #print('Overridden!')
+            idx = standard_idx.clone().to(torch.float32)
+            idx[idx_override != standard_idx] = ((interpolation_factor * idx_override.to(h.device)) + ((1 - interpolation_factor) * standard_idx))[idx_override != standard_idx].to(torch.float32)
+        else:
+            idx = standard_idx
+        #print('Idx:', idx.tolist())
+        freqs_cis = compute_freqs_cis(idx, self.params.dim // self.params.n_heads)
+        #print('Freqs:', freqs_cis.sum(-1).cpu().numpy())
 
         mask = None
         if seqlen > 1:
@@ -218,6 +244,42 @@ class Transformer(nn.Module):
                 (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
             )
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+
+            # Compute the multiplicative mask, instead of additive
+
+            multiplicative_mask = torch.zeros((1, 1, seqlen, seqlen), device=tokens.device)
+            # multiplicative_mask[i, j] = 1 if j is used to predict i, 0 otherwise
+            # Note: with the current implementation, it's also possible to have other values
+
+            for i in range(seqlen):
+                # The first token always has weight 1
+                multiplicative_mask[0, 0, i, 0] = 1
+                for j in range(1, seqlen):
+                    source_position = idx[j] # The position we are looking at
+                    target_position = idx[i] # The position we are trying to predict
+
+                    if target_position < source_position:
+                        # We can't look into the future
+                        multiplicative_mask[0, 0, i, j] = 0
+                        continue
+
+                    # Riemann integration: the weight of source_position is equal
+                    # to how much "time" (delta_x) has passed since the last time
+                    # we saw another position (previous_position)
+
+                    all_previous_positions = idx[idx < source_position]
+
+                    previous_position = torch.max(all_previous_positions)
+                    #print('Target:', target_position, 'Previous:', previous_position)
+
+                    delta_x = source_position - previous_position
+
+                    multiplicative_mask[0, 0, i, j] = delta_x
+
+            # The transformer accepts an additive mask for the logit, so we compute the additive mask
+            # as the log of the multiplicative mask, due to the fact that:
+            # multiplicative_mask * exp(logit) = exp(logit + log(multiplicative_mask))
+            mask = torch.log(multiplicative_mask + 1e-9)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)

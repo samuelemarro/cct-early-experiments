@@ -43,6 +43,85 @@ class LLaMA:
 
         return False
 
+    def next_prediction(self, prompt):
+        prompt_tokens = torch.tensor([self.tokenizer.encode(prompt, bos=True, eos=False)], device='cuda').long()
+
+        return self.next_prediction_given_tokens(prompt_tokens)
+        
+    def next_prediction_custom(self, prompt, flip_a, flip_b, interpolation_factor):
+        # Runs as normal, but flips th idx_override of two tokens (flip_a and flip_b)
+        #print('Prompt:', prompt)
+        
+        # Convert flip_a and flip_b into ids
+        flip_a_ids = self.tokenizer.encode(flip_a, bos=False, eos=False)
+        flip_b_ids = self.tokenizer.encode(flip_b, bos=False, eos=False)
+
+        # The first ID is 29871, which marks the beginning of a word
+        assert flip_a_ids[0] == 29871
+        assert flip_b_ids[0] == 29871
+        assert len(flip_a_ids) == 2, 'Flip a should be a single token'
+        assert len(flip_b_ids) == 2, 'Flip b should be a single token'
+
+        flip_a_id = flip_a_ids[1]
+        flip_b_id = flip_b_ids[1]
+
+        # print('Flip a:', flip_a_id)
+        # print('Flip b:', flip_b_id)
+        #assert len(flip_a_id) == 1, 'Flip a should be a single token'
+        #assert len(flip_b_id) == 1, 'Flip b should be a single token'
+        #flip_a_id = flip_a_id[0]
+        #flip_b_id = flip_b_id[0]
+
+        prompt_tokens = torch.tensor([self.tokenizer.encode(prompt, bos=True, eos=False)], device='cuda').long()
+        idx_override = torch.arange(prompt_tokens.shape[1], device='cuda').long()
+
+        # print('Prompt tokens:', prompt_tokens[0].tolist())
+        # Convert explicitly each token to its id
+        # print('Decoded prompt:', [self.tokenizer.decode([token]) for token in prompt_tokens[0].tolist()])
+
+        # Find the position of a and b, ensuring that they only appear once
+        a_pos = None
+        b_pos = None
+        for i, token in enumerate(prompt_tokens[0]):
+            if token == flip_a_id:
+                if a_pos is not None:
+                    raise ValueError("flip_a appears multiple times in the prompt")
+                a_pos = i
+            if token == flip_b_id:
+                if b_pos is not None:
+                    raise ValueError("flip_b appears multiple times in the prompt")
+                b_pos = i
+        
+        # print('A pos:', a_pos, 'B pos:', b_pos)
+
+        # Flip the idx_override of a and b
+        idx_override[a_pos] = b_pos
+        idx_override[b_pos] = a_pos
+
+        # print('Idx override:', idx_override.tolist())
+
+        prompt_tokens_with_override = prompt_tokens[:, idx_override]
+        # Decode the prompt with the override
+        # print('Overriden:', self.tokenizer.decode(prompt_tokens_with_override[0].tolist()))
+
+
+        return self.next_prediction_given_tokens(prompt_tokens, idx_override=idx_override, interpolation_factor=interpolation_factor)
+
+    def next_prediction_given_tokens(self, tokens, idx_override = None, interpolation_factor = None):
+        prev_pos = 0
+        cur_pos = len(tokens[0])
+        feeded_tokens = tokens[:, prev_pos:cur_pos]
+        logits = self.model(feeded_tokens, prev_pos, idx_override=idx_override, interpolation_factor=interpolation_factor)
+
+        probs = torch.softmax(logits, dim=-1)
+
+        # Take the 10 most likely tokens with top-k
+        top_k = 10
+        probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+
+        # Return a list of pairs (decoded token, probability)
+        return [(self.tokenizer.decode([idx.item()]), prob.item()) for idx, prob in zip(probs_idx[0][:top_k], probs_sort[0][:top_k])]
+
     def generate(
         self,
         prompts: List[str],
