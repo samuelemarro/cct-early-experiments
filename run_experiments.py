@@ -6,6 +6,6 @@ for experiment in [
     'time_scale',
     'time_shift'
 ]:
-    command = f'python final_tests/{experiment}.py'
+    command = f'python experiments/{experiment}.py'
     print(command)
     os.system(command)
