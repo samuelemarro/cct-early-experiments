@@ -1,0 +1,40 @@
+{
+    "setups" : [
+        {
+            "number_1" : 24,
+            "number_2" : 13
+        },
+        { 
+            "number_1" : 32,
+            "number_2" : 56
+        },
+        { 
+            "number_1" : 13,
+            "number_2" : 74
+        },
+        { 
+            "number_1" : 52,
+            "number_2" : 31
+        },
+        { 
+            "number_1" : 14,
+            "number_2" : 23
+        },
+        { 
+            "number_1" : 16,
+            "number_2" : 42
+        },
+        { 
+            "number_1" : 82,
+            "number_2" : 14
+        },
+        { 
+            "number_1" : 38,
+            "number_2" : 51
+        }
+    ],
+    "interest_threshold" : 0.05,
+    "integration_techniques" : [
+        "riemann"
+    ]
+}

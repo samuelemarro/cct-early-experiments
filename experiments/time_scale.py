@@ -1,9 +1,13 @@
+import sys
+sys.path.append('.')
+
 import torch
 
 import json
 from pathlib import Path
 from llama import ModelArgs, Transformer, Tokenizer, LLaMA
 
+from plot_utils import plot_interpolation_curve
 
 def load(
     ckpt_dir: str,
@@ -36,7 +40,6 @@ def load(
     generator = LLaMA(model, tokenizer)
     return generator
 
-
 def run(
     ckpt_dir: str,
     tokenizer_path: str,
@@ -50,20 +53,50 @@ def run(
     generator = load(
         ckpt_dir, tokenizer_path, local_rank, world_size, max_seq_len, max_batch_size
     )
-    prompts = [
-        # For these prompts, the expected answer is the natural continuation of the prompt
-        "I believe the meaning of life is",  # removed: keep only one prompt
-    ]
-    while True:
-        print("Prompt:", prompts)
-        results = generator.generate(
-            prompts, max_gen_len=256, temperature=temperature, top_p=top_p
-        )
-        for result in results:
-            print("🦙LLaMA:", result.strip())
+    generator.model.eval()
 
-        user_input = input("please enter your prompts (Ctrl+C to exit): ")
-        prompts = [user_input]
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+
+    interest_threshold = config['interest_threshold']
+
+    for integration_technique in config['integration_techniques']:
+        for setup_id, setup in enumerate(config['setups']):
+            number_1 = setup['number_1']
+            number_2 = setup['number_2']
+
+            digits = {str(s) for s in range(10)}
+
+            probs = {
+                digit: []
+                for digit in digits
+            }
+
+            import numpy as np
+
+            interpolation_factors = np.linspace(0.05, 1, 100)
+
+            tokens = generator.tokenizer.encode(f"The sum of {number_1} and {number_2} is ", bos=True, eos=False)
+            embeddings = generator.model.tok_embeddings(torch.tensor(tokens, device='cuda'))
+            idx = torch.arange(embeddings.shape[0], device='cuda')
+            # CCT indices are 1-indexed
+            idx = idx + 1
+            
+            for interpolation_factor in interpolation_factors:
+                actual_idx = idx * interpolation_factor
+
+                result = generator.next_prediction_given_raw(actual_idx, embeddings.unsqueeze(0), integration_technique=integration_technique)
+                #print(result)
+
+                # For some God-forsaken reason, there are multiple results for the same digit. Probably due to equivalent Unicode characters.
+                for digit in digits:
+                    total = 0
+                    for key, value in result:
+                        if key == digit:
+                            total += value
+                    probs[digit].append(total)
+            
+            plot_interpolation_curve(interpolation_factors, probs, interest_threshold, None, f'results/time_scale/{integration_technique}/time_scale_{setup_id}.png')
 
 
 def get_args():
@@ -82,7 +115,7 @@ if __name__ == "__main__":
     run(
         ckpt_dir=args.ckpt_dir,
         tokenizer_path=args.tokenizer_path,
-        temperature=0.8,
+        temperature=0,
         top_p=0.95,
         max_seq_len=1024,
         max_batch_size=1,

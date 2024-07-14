@@ -122,6 +122,83 @@ class LLaMA:
         # Return a list of pairs (decoded token, probability)
         return [(self.tokenizer.decode([idx.item()]), prob.item()) for idx, prob in zip(probs_idx[0][:top_k], probs_sort[0][:top_k])]
 
+    def next_prediction_given_tokens_and_embedding(self, tokens, embedding):
+        prev_pos = 0
+        cur_pos = len(tokens[0])
+        feeded_tokens = tokens[:, prev_pos:cur_pos]
+        logits = self.model.forward_with_embeddings(feeded_tokens, prev_pos, embedding)
+
+        probs = torch.softmax(logits, dim=-1)
+
+        # Take the 10 most likely tokens with top-k
+        top_k = 10
+        probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+
+        # Return a list of pairs (decoded token, probability)
+        return [(self.tokenizer.decode([idx.item()]), prob.item()) for idx, prob in zip(probs_idx[0][:top_k], probs_sort[0][:top_k])]
+
+    def embedding_interpolation_test(self, prompt, original_token, new_token, interpolation_factor, interpolate_fn):
+        # Get the embeddings of token_a and token_b
+        original_token_ids = self.tokenizer.encode(original_token, bos=False, eos=False)
+        new_token_ids = self.tokenizer.encode(new_token, bos=False, eos=False)
+
+        original_token_id = original_token_ids[1]
+        new_token_id = new_token_ids[1]
+
+        prompt_tokens = torch.tensor([self.tokenizer.encode(prompt, bos=True, eos=False)], device='cuda').long()
+
+        # Find the position of the original token and ensure it only appears once
+        original_token_pos = None
+
+        for i, token in enumerate(prompt_tokens[0]):
+            if token == original_token_id:
+                if original_token_pos is not None:
+                    raise ValueError("original_token appears multiple times in the prompt")
+                original_token_pos = i
+        
+
+        # Get the embeddings of the tokens
+        embedding_original = self.model.tok_embeddings(torch.tensor([original_token_id], device='cuda'))[0]
+        embedding_new = self.model.tok_embeddings(torch.tensor([new_token_id], device='cuda'))[0]
+
+        # Get the embeddings of the whole token sequence
+        embeddings_prompt = self.model.tok_embeddings(prompt_tokens)
+
+        # Interpolate between the embeddings
+        interpolated_embedding = interpolate_fn(embedding_original, embedding_new, interpolation_factor)
+
+        # Replace the embedding of the original token with the interpolated embedding
+        new_embeddings_prompt = embeddings_prompt.clone()
+        new_embeddings_prompt[0, original_token_pos] = interpolated_embedding
+
+        # print('Interpolated:', interpolated_embedding)
+
+        # Run the model with the interpolated embedding
+        result = self.next_prediction_given_tokens_and_embedding(prompt_tokens, new_embeddings_prompt)
+        print('Interpolation factor:', interpolation_factor.item(), 'Result:', result)
+
+        return result
+
+    def next_prediction_given_raw(self, idx, embeddings, integration_technique='trapezoidal', integration_start=0):
+        prev_pos = 0
+        logits = self.model.forward_raw(idx, embeddings, prev_pos, integration_technique=integration_technique, integration_start=integration_start)
+
+        probs = torch.softmax(logits, dim=-1)
+
+        # Take the 100000 most likely tokens with top-k
+        top_k = 100000
+        probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+
+        #print(probs_sort.shape)
+        #print(probs_idx.shape)
+
+        #print(self.tokenizer.decode([probs_idx[0, 0].item()]) == '3')
+        #print(probs_sort[0, 0].item())
+
+        # Return a list of pairs (decoded token, probability)
+        return [(self.tokenizer.decode([idx.item()]), prob.item()) for idx, prob in zip(probs_idx[0, :top_k], probs_sort[0, :top_k])]
+        #return [(self.tokenizer.decode([idx.item()]), prob.item()) for idx, prob in zip(probs_idx[0], probs_sort[0])]
+
     def generate(
         self,
         prompts: List[str],

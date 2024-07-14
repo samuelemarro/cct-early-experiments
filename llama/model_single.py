@@ -113,6 +113,7 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
+        assert start_pos == 0
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -219,11 +220,17 @@ class Transformer(nn.Module):
         # )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int, idx_override = None, interpolation_factor=None):
+    def forward(self, tokens: torch.Tensor, start_pos: int, idx_override = None, interpolation_factor=None, integration_technique='trapezoidal', interpolate_embeddings=True):
         _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+        if interpolation_factor is None or not interpolate_embeddings:
+            h = self.tok_embeddings(tokens)
+        else:
+            #print(idx_override)
+            actual_interpolation_factor = interpolation_factor if interpolation_factor < 0.5 else 1 - interpolation_factor
+            h = actual_interpolation_factor * self.tok_embeddings(tokens)[:, idx_override] + (1 - actual_interpolation_factor) * self.tok_embeddings(tokens)
         #self.freqs_cis = self.freqs_cis.to(h.device)
         #freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        #idx_override = None
 
         standard_idx = torch.arange(start_pos, start_pos + seqlen, device=h.device)
 
@@ -234,9 +241,113 @@ class Transformer(nn.Module):
             idx[idx_override != standard_idx] = ((interpolation_factor * idx_override.to(h.device)) + ((1 - interpolation_factor) * standard_idx))[idx_override != standard_idx].to(torch.float32)
         else:
             idx = standard_idx
+        
+        return self.forward_raw(idx, h, start_pos, integration_technique)
+
+    def forward_raw(self, idx: torch.Tensor, h: torch.Tensor, start_pos : int, integration_technique='trapezoidal', integration_start=0):
+        #idx = standard_idx
+        seqlen = h.shape[1]
+
+        assert start_pos == 0
+
         #print('Idx:', idx.tolist())
         freqs_cis = compute_freqs_cis(idx, self.params.dim // self.params.n_heads)
         #print('Freqs:', freqs_cis.sum(-1).cpu().numpy())
+
+        if seqlen > 1:
+            # Compute the multiplicative mask, instead of additive
+            multiplicative_mask = torch.zeros((1, 1, seqlen, seqlen), device=h.device)
+            # multiplicative_mask[i, j] = 1 if j is used to predict i, 0 otherwise
+            # Note: with the current implementation, it's also possible to have other values
+
+            for i in range(seqlen):
+                if integration_technique == 'riemann':
+                    for j in range(0, seqlen):
+                        source_position = idx[j] # The position we are looking at
+                        target_position = idx[i] # The position we are trying to predict
+
+                        if target_position < source_position:
+                            # We can't look into the future
+                            multiplicative_mask[0, 0, i, j] = 0
+                            continue
+
+                        # Rectangle integration: the weight of source_position is equal
+                        # to how much "time" (delta_x) has passed since the last time
+                        # we saw another position (previous_position)
+
+                        all_previous_positions = idx[idx < source_position]
+
+                        if len(all_previous_positions) == 0:
+                            previous_position = integration_start
+                        else:
+                            previous_position = torch.max(all_previous_positions)
+                        #print('Target:', target_position, 'Previous:', previous_position)
+
+                        delta_x = source_position - previous_position
+
+                        multiplicative_mask[0, 0, i, j] = delta_x
+                elif integration_technique == 'trapezoidal':
+                    # TODO: Doesn't take into account integration_start
+                    assert False
+                    for j in range(0, seqlen):
+                        source_position = idx[j] # The position we are looking at
+                        target_position = idx[i] # The position we are trying to predict
+
+                        if target_position < source_position:
+                            # We can't look into the future
+                            multiplicative_mask[0, 0, i, j] = 0
+                            continue
+
+                        # Riemann integration: the weight of source_position is equal
+                        # to how much "time" (delta_x) has passed since the last time
+                        # we saw another position (previous_position)
+
+                        all_previous_positions = idx[idx < source_position]
+                        all_next_positions = idx[idx > source_position]
+
+                        previous_position = torch.max(all_previous_positions) if len(all_previous_positions) > 0 else None
+                        next_position = torch.min(all_next_positions) if len(all_next_positions) > 0 else None
+                        #print('Target:', target_position, 'Previous:', previous_position)
+
+                        contribution = 0
+
+                        if previous_position is not None:
+                            contribution += (source_position - previous_position) / 2
+                        if next_position is not None:
+                            contribution += (next_position - source_position) / 2
+
+                        #delta_xs = []
+
+                        #if previous_position is not None:
+                        #    delta_xs.append(source_position - previous_position)
+                        #if next_position is not None:
+                        #    delta_xs.append(next_position - source_position)
+
+                        multiplicative_mask[0, 0, i, j] = contribution
+                else:
+                    raise ValueError('Invalid integration technique')
+
+            #print(multiplicative_mask)
+
+            # The transformer accepts an additive mask for the logit, so we compute the additive mask
+            # as the log of the multiplicative mask, due to the fact that:
+            # multiplicative_mask * exp(logit) = exp(logit + log(multiplicative_mask))
+            mask = torch.log(multiplicative_mask + 1e-9)
+        else:
+            raise NotImplementedError('Seqlen must be greater than 1')
+
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+        output = self.output(h[:, -1, :])  # only compute last logits
+        return output.float()
+
+    @torch.inference_mode()
+    def forward_with_embeddings(self, tokens: torch.Tensor, start_pos: int, embedding_override = None):
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens) if embedding_override is None else embedding_override
+        standard_idx = torch.arange(start_pos, start_pos + seqlen, device=h.device)
+        freqs_cis = compute_freqs_cis(standard_idx, self.params.dim // self.params.n_heads)
 
         mask = None
         if seqlen > 1:
@@ -244,42 +355,6 @@ class Transformer(nn.Module):
                 (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
             )
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
-
-            # Compute the multiplicative mask, instead of additive
-
-            multiplicative_mask = torch.zeros((1, 1, seqlen, seqlen), device=tokens.device)
-            # multiplicative_mask[i, j] = 1 if j is used to predict i, 0 otherwise
-            # Note: with the current implementation, it's also possible to have other values
-
-            for i in range(seqlen):
-                # The first token always has weight 1
-                multiplicative_mask[0, 0, i, 0] = 1
-                for j in range(1, seqlen):
-                    source_position = idx[j] # The position we are looking at
-                    target_position = idx[i] # The position we are trying to predict
-
-                    if target_position < source_position:
-                        # We can't look into the future
-                        multiplicative_mask[0, 0, i, j] = 0
-                        continue
-
-                    # Riemann integration: the weight of source_position is equal
-                    # to how much "time" (delta_x) has passed since the last time
-                    # we saw another position (previous_position)
-
-                    all_previous_positions = idx[idx < source_position]
-
-                    previous_position = torch.max(all_previous_positions)
-                    #print('Target:', target_position, 'Previous:', previous_position)
-
-                    delta_x = source_position - previous_position
-
-                    multiplicative_mask[0, 0, i, j] = delta_x
-
-            # The transformer accepts an additive mask for the logit, so we compute the additive mask
-            # as the log of the multiplicative mask, due to the fact that:
-            # multiplicative_mask * exp(logit) = exp(logit + log(multiplicative_mask))
-            mask = torch.log(multiplicative_mask + 1e-9)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)

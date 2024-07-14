@@ -101,6 +101,35 @@ def run(
 
     interpolation_factors = np.linspace(0, 1, 100)
 
+    tokens = generator.tokenizer.encode("The sum of 24 and 33 is ", bos=True, eos=False)
+
+    # Indexing as [0, 1, 2, 3, 4, 5, 6, 7, 8] + [8, 9, 10, 11] + [11, 12]. Note the repetition of 8 and 11
+    # The sum of 24 and [' ', 1, 3, is] is
+    new_tokens = tokens[:9] + [tokens[8], tokens[9], tokens[10], tokens[11]] + tokens[11:] 
+
+    #idx = torch.arange(len(tokens), device='cuda')
+    idx = torch.tensor(list(range(9)) + [8.9, 9, 10, 10.8] + list(range(11, len(tokens))), device='cuda')
+    print(idx)
+
+    h = generator.model.tok_embeddings(torch.tensor(new_tokens, device='cuda').unsqueeze(0))
+
+    #print(tokens)
+    #print([generator.tokenizer.decode([t]) for t in tokens])
+
+    print([
+        (i.item(), t, generator.tokenizer.decode([t])) for
+        i, t in zip(idx, new_tokens)
+    ])
+    #exit(0)
+
+    #print(idx.shape)
+    #print(h.shape)
+
+    output = generator.next_prediction_given_raw(idx, h)
+
+    print(output)
+    exit(0)
+
     for interpolation_factor in interpolation_factors:
 
         result = generator.next_prediction_custom(
