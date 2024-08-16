@@ -4,25 +4,7 @@ import matplotlib.pyplot as plt
 
 DIGITS = [str(i) for i in range(10)]
 
-import colorsys
 
-COLORS = {
-    #str(digit) : colorsys.hls_to_rgb((digit + 1) / 10, 0.4, 0.9)
-    str(digit) : f'tab:{digit}'
-    for digit in range(10)
-}
-COLORS = {
-    '0': 'tab:blue',
-    '1': 'tab:orange',
-    '2': 'tab:green',
-    '3': 'tab:red',
-    '4': 'tab:purple',
-    '5': 'tab:brown',
-    '6': 'tab:pink',
-    '7': 'tab:gray',
-    '8': 'tab:olive',
-    '9': 'tab:cyan',
-}
 # Use in the rainbow order
 COLORS = ['tab:red', 'tab:orange', 'tab:olive', 'tab:green', 'tab:cyan', 'tab:blue', 'tab:pink', 'tab:purple', 'tab:brown', 'xkcd:burnt siena']
 COLORS = {k : v for k, v in zip(DIGITS, COLORS)}
@@ -41,9 +23,7 @@ def plot_interpolation_curve(interpolation_factors, probs, interest_threshold, t
     # Compute the sum of all non-interesting probs
     non_interesting_probs = [sum([probs[digit][i] for digit in non_interesting_digits]) for i in range(len(interpolation_factors))]
 
-    #print(result)
-
-    print('Interesting digits:', interesting_digits)
+    print('Plotting graph with interesting digits:', interesting_digits)
 
     for digit in interesting_digits:
         plt.plot(interpolation_factors, probs[digit], label=digit, color=COLORS[digit])
